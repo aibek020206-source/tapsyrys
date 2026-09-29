@@ -18,7 +18,7 @@ CLIENT_SECRET = os.environ.get("CANVA_CLIENT_SECRET")
 
 REDIRECT_URI = os.environ.get(
     "CANVA_REDIRECT_URI",
-    "https://tapsyryys.onrender.com/canva/callback"
+    "https://tapsyrys.onrender.com/canva/callback"
 )
 
 CANVA_AUTHORIZE_URL = (
