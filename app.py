@@ -1,93 +1,88 @@
 from flask import Flask, request, redirect, jsonify
-import requests
 import os
 import secrets
-import hashlib
 import base64
 from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+import json
 
 app = Flask(__name__)
 
-# =========================
+# ==============================
 # CANVA CONFIGURATION
-# =========================
+# ==============================
 
 CLIENT_ID = os.environ.get("CANVA_CLIENT_ID")
 CLIENT_SECRET = os.environ.get("CANVA_CLIENT_SECRET")
 
 REDIRECT_URI = os.environ.get(
     "CANVA_REDIRECT_URI",
-    "https://tapsyrys.onrender.com/canva/callback"
+    "https://tapsyryys.onrender.com/canva/callback"
 )
 
-AUTH_URL = "https://www.canva.com/api/oauth/authorize"
-TOKEN_URL = "https://api.canva.com/rest/v1/oauth/token"
+CANVA_AUTHORIZE_URL = "https://www.canva.com/api/oauth/authorize"
+CANVA_TOKEN_URL = "https://api.canva.com/rest/v1/oauth/token"
 
-# Temporary storage for OAuth
-oauth_sessions = {}
+# Temporary storage for OAuth state
+oauth_states = set()
 
 
-# =========================
+# ==============================
 # HOME
-# =========================
+# ==============================
 
 @app.route("/")
 def home():
     return """
-    <h1>Tapsyrys AI сервері жұмыс істеп тұр! ✅</h1>
-    <p>Canva интеграциясы дайын.</p>
-    <p><a href="/canva/login">Canva-ға қосылу</a></p>
+    <h2>Tapsyrys AI сервері жұмыс істеп тұр! ✅</h2>
+
+    <p>Canva:</p>
+
+    <a href="/canva/login">
+        <button style="
+            padding:12px 25px;
+            font-size:18px;
+            cursor:pointer;
+        ">
+            Canva-ға кіру
+        </button>
+    </a>
     """
 
 
-# =========================
+# ==============================
 # CANVA LOGIN
-# =========================
+# ==============================
 
 @app.route("/canva/login")
 def canva_login():
 
     if not CLIENT_ID:
         return """
-        <h2>CANVA_CLIENT_ID табылмады ❌</h2>
-        <p>Render → Environment ішіне CANVA_CLIENT_ID қосыңыз.</p>
-        """
-
-    # PKCE
-    code_verifier = secrets.token_urlsafe(64)
-
-    code_challenge = base64.urlsafe_b64encode(
-        hashlib.sha256(
-            code_verifier.encode("utf-8")
-        ).digest()
-    ).decode("utf-8").rstrip("=")
+        <h3>❌ CANVA_CLIENT_ID табылмады</h3>
+        <p>Render → Environment Variables бөлімін тексеріңіз.</p>
+        """, 500
 
     state = secrets.token_urlsafe(32)
-
-    oauth_sessions[state] = {
-        "code_verifier": code_verifier
-    }
+    oauth_states.add(state)
 
     params = {
-        "code_challenge": code_challenge,
-        "code_challenge_method": "S256",
         "client_id": CLIENT_ID,
         "redirect_uri": REDIRECT_URI,
         "response_type": "code",
+        "scope": "design:content:read design:content:write",
         "state": state
     }
 
-    # Қажетті permission-дер
-    params["scope"] = "design:content:read design:content:write"
-
-    url = AUTH_URL + "?" + urlencode(params)
+    url = CANVA_AUTHORIZE_URL + "?" + urlencode(params)
 
     return redirect(url)
 
 
-# =========================
+# ==============================
 # CANVA CALLBACK
-# =========================
+# ==============================
 
 @app.route("/canva/callback")
 def canva_callback():
@@ -97,13 +92,14 @@ def canva_callback():
     if error:
         description = request.args.get(
             "error_description",
-            "Canva авторизациядан бас тартты."
+            "Белгісіз қате"
         )
 
         return f"""
-        <h2>Canva авторизация қатесі ❌</h2>
+        <h2>❌ Canva авторизация қатесі</h2>
+        <p><b>Error:</b> {error}</p>
         <p>{description}</p>
-        """
+        """, 400
 
     code = request.args.get("code")
     state = request.args.get("state")
@@ -112,147 +108,146 @@ def canva_callback():
         return """
         <h2>Authorization code табылмады ❌</h2>
         <p>Canva-дан код келген жоқ.</p>
-        """
+        """, 400
 
-    if not state or state not in oauth_sessions:
+    if not state or state not in oauth_states:
         return """
-        <h2>State қатесі ❌</h2>
-        <p>OAuth сессиясы табылмады.</p>
-        """
+        <h2>Invalid state ❌</h2>
+        <p>Авторизация қауіпсіздік тексеруінен өтпеді.</p>
+        """, 400
 
-    code_verifier = oauth_sessions[state]["code_verifier"]
+    oauth_states.discard(state)
 
-    # Authorization code → access token
-    data = {
+    if not CLIENT_ID or not CLIENT_SECRET:
+        return """
+        <h2>❌ Canva credentials табылмады</h2>
+        <p>Render Environment Variables бөлімінен:</p>
+        <ul>
+            <li>CANVA_CLIENT_ID</li>
+            <li>CANVA_CLIENT_SECRET</li>
+        </ul>
+        тексеріңіз.
+        """, 500
+
+    # ==========================
+    # TOKEN REQUEST
+    # ==========================
+
+    credentials = f"{CLIENT_ID}:{CLIENT_SECRET}"
+
+    basic_auth = base64.b64encode(
+        credentials.encode("utf-8")
+    ).decode("utf-8")
+
+    token_data = urlencode({
         "grant_type": "authorization_code",
         "code": code,
-        "redirect_uri": REDIRECT_URI,
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "code_verifier": code_verifier
-    }
+        "redirect_uri": REDIRECT_URI
+    }).encode("utf-8")
+
+    token_request = Request(
+        CANVA_TOKEN_URL,
+        data=token_data,
+        method="POST",
+        headers={
+            "Authorization": f"Basic {basic_auth}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json"
+        }
+    )
 
     try:
-        response = requests.post(
-            TOKEN_URL,
-            data=data,
-            timeout=30
-        )
+        with urlopen(token_request, timeout=30) as response:
+            response_data = response.read().decode("utf-8")
 
-        result = response.json()
+        token_json = json.loads(response_data)
+
+    except HTTPError as e:
+
+        error_body = e.read().decode("utf-8", errors="replace")
+
+        return f"""
+        <h2>❌ Canva Token қатесі</h2>
+
+        <p><b>HTTP:</b> {e.code}</p>
+
+        <pre>{error_body}</pre>
+        """, 400
+
+    except URLError as e:
+
+        return f"""
+        <h2>❌ Canva серверіне қосылу қатесі</h2>
+
+        <p>{e}</p>
+        """, 500
 
     except Exception as e:
+
         return f"""
-        <h2>Canva серверіне қосылу қатесі ❌</h2>
-        <p>{str(e)}</p>
-        """
+        <h2>❌ Қате</h2>
 
-    if response.status_code != 200:
-        return jsonify({
-            "error": "Canva token error",
-            "status": response.status_code,
-            "response": result
-        }), response.status_code
+        <pre>{e}</pre>
+        """, 500
 
-    access_token = result.get("access_token")
+    access_token = token_json.get("access_token")
 
     if not access_token:
-        return jsonify({
-            "error": "Access token алынбады",
-            "response": result
-        }), 400
 
-    # Demo үшін session ішінде сақтау
-    oauth_sessions[state]["access_token"] = access_token
+        return f"""
+        <h2>❌ Access token алынбады</h2>
 
-    return """
-    <h1>Canva сәтті қосылды! ✅</h1>
+        <pre>{json.dumps(token_json, indent=2, ensure_ascii=False)}</pre>
+        """, 400
 
-    <p>Tapsyrys AI Canva аккаунтымен байланыстырылды.</p>
+    return f"""
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>Canva Connected</title>
+    </head>
 
-    <p>Енді келесі кезеңге өтуге болады:</p>
+    <body style="
+        font-family: Arial;
+        padding: 40px;
+        text-align: center;
+    ">
 
-    <ul>
-        <li>Презентация тақырыбын алу</li>
-        <li>Слайд санын алу</li>
-        <li>Canva дизайнын жасау</li>
-        <li>Контент қосу</li>
-        <li>Презентацияны дайындау</li>
-    </ul>
+        <h1>Canva сәтті қосылды! ✅</h1>
 
-    <a href="/">Басты бетке қайту</a>
+        <p>Authorization code қабылданды.</p>
+
+        <p>
+            Access token сәтті алынды.
+        </p>
+
+        <p style="color:green;">
+            Tapsyrys AI Canva интеграциясы жұмыс істеп тұр.
+        </p>
+
+    </body>
+    </html>
     """
 
 
-# =========================
-# TEST CANVA CONNECTION
-# =========================
-
-@app.route("/canva/test")
-def canva_test():
-
-    token = None
-
-    for session in oauth_sessions.values():
-        if session.get("access_token"):
-            token = session["access_token"]
-            break
-
-    if not token:
-        return """
-        <h2>Canva әлі қосылмаған ❌</h2>
-        <a href="/canva/login">Canva-ға қосылу</a>
-        """
-
-    return jsonify({
-        "status": "success",
-        "message": "Canva access token бар ✅"
-    })
-
-
-# =========================
-# PRESENTATION REQUEST
-# =========================
-
-@app.route("/presentation", methods=["POST"])
-def presentation():
-
-    data = request.get_json(silent=True) or {}
-
-    topic = data.get("topic", "")
-    slides = data.get("slides", 8)
-    language = data.get("language", "Kazakh")
-
-    if not topic:
-        return jsonify({
-            "error": "Тақырып енгізілмеген"
-        }), 400
-
-    return jsonify({
-        "status": "received",
-        "topic": topic,
-        "slides": slides,
-        "language": language,
-        "message": "Презентация тапсырысы қабылданды ✅"
-    })
-
-
-# =========================
+# ==============================
 # HEALTH CHECK
-# =========================
+# ==============================
 
 @app.route("/health")
 def health():
     return jsonify({
-        "status": "ok"
+        "status": "ok",
+        "service": "Tapsyrys AI"
     })
 
 
-# =========================
-# START SERVER
-# =========================
+# ==============================
+# START
+# ==============================
 
 if __name__ == "__main__":
+
     port = int(os.environ.get("PORT", 10000))
 
     app.run(
