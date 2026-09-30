@@ -435,6 +435,7 @@ def make_local_slides(topic, subject, quantity):
 
     return {
         "title": topic,
+        "subject": subject,
         "slides": [
             {
                 "title": title,
@@ -476,7 +477,7 @@ def search_wikimedia_image(query):
         "generator": "search",
         "gsrsearch": query,
         "gsrnamespace": "6",
-        "gsrlimit": "8",
+        "gsrlimit": "20",
         "prop": "imageinfo",
         "iiprop": "url",
         "iiurlwidth": "1200",
@@ -564,45 +565,121 @@ def download_image(image_url):
         return None
 
 
-def find_slide_image(topic, subject, slide_title):
+def find_slide_image(topic, subject, slide_title, extra_text="", used_urls=None):
     """
-    Алдымен тақырып + слайд атауы бойынша іздейді.
-    Табылмаса topic + subject бойынша іздейді.
+    Слайдтың нақты мазмұнына сәйкес сурет іздейді.
+    Әр слайдқа мүмкіндігінше бөлек сурет таңдалады.
     """
 
+    used_urls = used_urls if used_urls is not None else set()
+
+    topic = clean_search_text(topic)
+    subject = clean_search_text(subject)
+    slide_title = clean_search_text(slide_title)
+    extra_text = clean_search_text(extra_text)
+
+    # Ең нақты іздеу бірінші орындалады.
     queries = [
-        f"{topic} {slide_title}",
-        f"{subject} {topic}",
-        topic,
-        subject,
+        f"{topic} {slide_title} {extra_text}".strip(),
+        f"{topic} {slide_title}".strip(),
+        f"{subject} {slide_title}".strip(),
+        f"{topic}".strip(),
+        f"{subject}".strip(),
     ]
 
-    used = set()
+    used_queries = set()
 
     for query in queries:
         query = clean_search_text(query)
-
-        if not query or query.lower() in used:
+        if not query or query.lower() in used_queries:
             continue
+        used_queries.add(query.lower())
 
-        used.add(query.lower())
+        results = search_wikimedia_images(query)
+        for result in results:
+            image_url = result.get("image_url")
+            if not image_url or image_url in used_urls:
+                continue
 
-        result = search_wikimedia_image(query)
-
-        if not result:
-            continue
-
-        image_stream = download_image(
-            result["image_url"]
-        )
-
-        if image_stream:
-            return {
-                **result,
-                "stream": image_stream,
-            }
+            image_stream = download_image(image_url)
+            if image_stream:
+                used_urls.add(image_url)
+                return {
+                    **result,
+                    "stream": image_stream,
+                }
 
     return None
+
+
+def search_wikimedia_images(query):
+    """Wikimedia Commons-тен бірнеше ықтимал сурет қайтарады."""
+    query = clean_search_text(query)
+    if not query:
+        return []
+
+    params = {
+        "action": "query",
+        "generator": "search",
+        "gsrsearch": query,
+        "gsrnamespace": "6",
+        "gsrlimit": "20",
+        "prop": "imageinfo",
+        "iiprop": "url|mime",
+        "iiurlwidth": "1200",
+        "format": "json",
+        "formatversion": "2",
+    }
+
+    url = WIKIMEDIA_API + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            data = json.loads(response.read().decode("utf-8"))
+
+        pages = data.get("query", {}).get("pages", [])
+        results = []
+
+        for page in pages:
+            imageinfo = page.get("imageinfo", [])
+            if not imageinfo:
+                continue
+
+            info = imageinfo[0]
+            mime = info.get("mime", "")
+            if not mime.startswith("image/"):
+                continue
+
+            image_url = info.get("thumburl") or info.get("url")
+            if not image_url:
+                continue
+
+            title = page.get("title", "Wikimedia Commons")
+            results.append({
+                "image_url": image_url,
+                "page_url": (
+                    "https://commons.wikimedia.org/wiki/"
+                    + urllib.parse.quote(title.replace(" ", "_"), safe="_:/")
+                ),
+                "title": title,
+            })
+
+        return results
+    except Exception:
+        return []
+
+
+def search_wikimedia_image(query):
+    """Бір сурет керек болған ескі шақырулар үшін үйлесімді функция."""
+    results = search_wikimedia_images(query)
+    return results[0] if results else None
 
 
 # =========================
@@ -689,6 +766,8 @@ def make_pptx(slides_data, order_id):
         []
     )
 
+    used_image_urls = set()
+
     # -------------------------
     # TITLE SLIDE
     # -------------------------
@@ -696,10 +775,16 @@ def make_pptx(slides_data, order_id):
         prs.slide_layouts[6]
     )
 
+    from pptx.dml.color import RGBColor
+    from pptx.enum.shapes import MSO_SHAPE
+    cover_bg = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(7.5))
+    cover_bg.fill.solid(); cover_bg.fill.fore_color.rgb = RGBColor(20, 27, 45); cover_bg.line.fill.background()
+
     title_image = find_slide_image(
         title,
-        "",
-        "cover"
+        slides_data.get("subject", ""),
+        "мұқаба",
+        used_urls=used_image_urls,
     )
 
     if title_image:
@@ -752,6 +837,14 @@ def make_pptx(slides_data, order_id):
             prs.slide_layouts[6]
         )
 
+        # Modern clean background and accent bar
+        from pptx.dml.color import RGBColor
+        from pptx.enum.shapes import MSO_SHAPE
+        bg = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(7.5))
+        bg.fill.solid(); bg.fill.fore_color.rgb = RGBColor(245, 247, 251); bg.line.fill.background()
+        bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(0.14), Inches(7.5))
+        bar.fill.solid(); bar.fill.fore_color.rgb = RGBColor(67, 97, 238); bar.line.fill.background()
+
         slide_title = str(
             item.get("title", "")
         )
@@ -761,10 +854,13 @@ def make_pptx(slides_data, order_id):
             []
         )
 
+        # Слайдтың тақырыбы мен мәтіні бойынша жеке сурет іздейміз.
         image_result = find_slide_image(
             title,
-            "",
-            slide_title
+            slides_data.get("subject", ""),
+            slide_title,
+            " ".join(str(x) for x in bullets[:2]),
+            used_urls=used_image_urls,
         )
 
         # Title
