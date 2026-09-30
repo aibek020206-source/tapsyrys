@@ -1,4 +1,2 @@
-Flask
-requests
-python-pptx
-gunicorn
+Flask>=3.0,<4
+requests>=2.31,<3
