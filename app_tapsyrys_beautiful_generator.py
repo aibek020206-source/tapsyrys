@@ -686,16 +686,14 @@ def search_wikimedia_image(query):
 # POWERPOINT
 # =========================
 def add_text_box(slide, text, left, top, width, height,
-                 font_size=18, bold=False):
+                 font_size=18, bold=False, color=(25, 32, 50),
+                 font_name="Aptos", align=None):
     from pptx.util import Inches, Pt
+    from pptx.dml.color import RGBColor
 
     box = slide.shapes.add_textbox(
-        Inches(left),
-        Inches(top),
-        Inches(width),
-        Inches(height),
+        Inches(left), Inches(top), Inches(width), Inches(height)
     )
-
     tf = box.text_frame
     tf.word_wrap = True
     tf.margin_left = Inches(0.05)
@@ -704,10 +702,13 @@ def add_text_box(slide, text, left, top, width, height,
     tf.margin_bottom = Inches(0.03)
 
     p = tf.paragraphs[0]
-    p.text = text
+    p.text = str(text)
     p.font.size = Pt(font_size)
     p.font.bold = bold
-
+    p.font.name = font_name
+    p.font.color.rgb = RGBColor(*color)
+    if align is not None:
+        p.alignment = align
     return box
 
 
@@ -737,218 +738,147 @@ def add_image_safely(slide, image_stream, left, top, width, height):
 
 
 def make_pptx(slides_data, order_id):
-    """
-    PPTX жасайды.
-    Әр слайдқа Wikimedia Commons-тен тегін сурет іздейді.
-    """
-
+    """Заманауи, әр слайдта әртүрлі layout қолданылатын PPTX генераторы."""
     try:
         from pptx import Presentation
         from pptx.util import Inches, Pt
+        from pptx.dml.color import RGBColor
+        from pptx.enum.shapes import MSO_SHAPE
+        from pptx.enum.text import PP_ALIGN
     except ImportError:
-        raise RuntimeError(
-            "python-pptx орнатылмаған. "
-            "requirements.txt ішіне python-pptx қосыңыз."
-        )
+        raise RuntimeError("python-pptx орнатылмаған.")
 
     prs = Presentation()
-
     prs.slide_width = Inches(13.333)
     prs.slide_height = Inches(7.5)
 
-    title = slides_data.get(
-        "title",
-        "Презентация"
-    )
+    title = str(slides_data.get("title", "Презентация"))
+    subject = str(slides_data.get("subject", ""))
+    slides = slides_data.get("slides", [])
+    used = set()
 
-    slides = slides_data.get(
-        "slides",
-        []
-    )
+    # Біртұтас заманауи палитра
+    NAVY = (18, 25, 43)
+    INK = (29, 36, 55)
+    MUTED = (95, 105, 125)
+    WHITE = (255, 255, 255)
+    LIGHT = (246, 248, 252)
+    ACCENTS = [(76, 93, 220), (24, 150, 137), (236, 126, 70), (157, 78, 221)]
 
-    used_image_urls = set()
+    def rect(slide, x, y, w, h, color, radius=False, line=None):
+        shape_type = MSO_SHAPE.ROUNDED_RECTANGLE if radius else MSO_SHAPE.RECTANGLE
+        s = slide.shapes.add_shape(shape_type, Inches(x), Inches(y), Inches(w), Inches(h))
+        s.fill.solid(); s.fill.fore_color.rgb = RGBColor(*color)
+        if line is None:
+            s.line.fill.background()
+        else:
+            s.line.color.rgb = RGBColor(*line)
+        return s
 
-    # -------------------------
-    # TITLE SLIDE
-    # -------------------------
-    slide = prs.slides.add_slide(
-        prs.slide_layouts[6]
-    )
+    def add_bullets(slide, bullets, x, y, w, h, size=19, color=INK):
+        box = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
+        tf = box.text_frame; tf.word_wrap = True
+        tf.margin_left = Inches(.03); tf.margin_right = Inches(.03)
+        for i, bullet in enumerate(bullets):
+            p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+            p.text = "•  " + str(bullet)
+            p.font.name = "Aptos"; p.font.size = Pt(size); p.font.color.rgb = RGBColor(*color)
+            p.space_after = Pt(12)
+        return box
 
-    from pptx.dml.color import RGBColor
-    from pptx.enum.shapes import MSO_SHAPE
-    cover_bg = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(7.5))
-    cover_bg.fill.solid(); cover_bg.fill.fore_color.rgb = RGBColor(20, 27, 45); cover_bg.line.fill.background()
+    def add_number(slide, n, color):
+        add_text_box(slide, f"{n:02d}", .65, 6.95, .7, .25, 9, True, color)
+        add_text_box(slide, "TAPSYRYS AI", 10.85, 6.95, 1.8, .25, 8, True, MUTED, align=PP_ALIGN.RIGHT)
 
-    title_image = find_slide_image(
-        title,
-        slides_data.get("subject", ""),
-        "мұқаба",
-        used_urls=used_image_urls,
-    )
+    # 1. Мұқаба — үлкен сурет + қараңғы панель
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    rect(slide, 0, 0, 13.333, 7.5, NAVY)
+    cover = find_slide_image(title, subject, "мұқаба", used_urls=used)
+    if cover:
+        add_image_safely(slide, cover["stream"], 7.55, 0, 5.783, 7.5)
+        rect(slide, 7.55, 0, 5.783, 7.5, (10, 15, 28))
+        # Жеңіл overlay орнына сол жақ панельді анық қалдырамыз
+        add_image_safely(slide, cover["stream"], 7.75, .35, 5.38, 6.8)
+    rect(slide, .65, .7, .9, .08, ACCENTS[0])
+    add_text_box(slide, subject.upper() if subject else "ПРЕЗЕНТАЦИЯ", .65, 1.1, 5.9, .45, 13, True, (160, 170, 195))
+    add_text_box(slide, title, .65, 2.0, 6.4, 2.0, 34, True, WHITE)
+    add_text_box(slide, "Қысқа, түсінікті және заманауи презентация", .65, 4.45, 5.8, .65, 16, False, (205, 211, 225))
+    add_text_box(slide, "Tapsyrys AI", .65, 6.75, 2.0, .35, 11, True, WHITE)
+    if cover:
+        add_text_box(slide, "Wikimedia Commons", 9.0, 6.95, 3.7, .25, 8, False, WHITE, align=PP_ALIGN.RIGHT)
 
-    if title_image:
-        add_image_safely(
-            slide,
-            title_image["stream"],
-            7.7,
-            0,
-            5.63,
-            7.5,
-        )
+    # 2+. Әртүрлі layout
+    for idx, item in enumerate(slides, start=1):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        accent = ACCENTS[(idx - 1) % len(ACCENTS)]
+        stitle = str(item.get("title", ""))
+        bullets = [str(x) for x in item.get("bullets", []) if str(x).strip()]
+        image = find_slide_image(title, subject, stitle, " ".join(bullets[:2]), used_urls=used)
+        layout_no = (idx - 1) % 4
 
-    add_text_box(
-        slide,
-        title,
-        0.7,
-        2.2,
-        6.4,
-        1.5,
-        font_size=30,
-        bold=True,
-    )
+        if layout_no == 0:
+            # SPLIT — мәтін + үлкен сурет
+            rect(slide, 0, 0, 13.333, 7.5, LIGHT)
+            rect(slide, 0, 0, .16, 7.5, accent)
+            add_text_box(slide, stitle, .7, .65, 7.0, 1.0, 27, True, INK)
+            add_bullets(slide, bullets, .75, 1.8, 6.5, 4.5, 18)
+            if image:
+                rect(slide, 8.0, 1.25, 4.55, 5.35, WHITE, True)
+                add_image_safely(slide, image["stream"], 8.15, 1.4, 4.25, 5.0)
+                add_text_box(slide, "Wikimedia Commons", 9.0, 6.55, 3.1, .25, 8, False, MUTED, align=PP_ALIGN.RIGHT)
+            add_number(slide, idx, accent)
 
-    add_text_box(
-        slide,
-        "Tapsyrys AI",
-        0.7,
-        4.0,
-        5.5,
-        0.6,
-        font_size=20,
-    )
+        elif layout_no == 1:
+            # CARDS — әр ой жеке карточка
+            rect(slide, 0, 0, 13.333, 7.5, WHITE)
+            add_text_box(slide, stitle, .7, .65, 11.6, .8, 28, True, INK)
+            add_text_box(slide, "Негізгі ойлар", .72, 1.45, 4, .35, 12, True, accent)
+            count = min(max(len(bullets), 1), 4)
+            cols = 2 if count > 1 else 1
+            rows = (count + cols - 1) // cols
+            card_w = 5.7 if cols == 2 else 11.5
+            for j in range(count):
+                r, c = divmod(j, cols)
+                x = .7 + c * 6.0; y = 2.0 + r * 2.05
+                rect(slide, x, y, card_w, 1.65, LIGHT, True)
+                rect(slide, x, y, .09, 1.65, accent)
+                txt = bullets[j] if j < len(bullets) else "Тақырыптың негізгі мазмұны."
+                add_text_box(slide, f"{j+1:02d}", x+.3, y+.25, .6, .4, 12, True, accent)
+                add_text_box(slide, txt, x+.95, y+.22, card_w-1.25, 1.1, 16, False, INK)
+            add_number(slide, idx, accent)
 
-    if title_image:
-        add_text_box(
-            slide,
-            "Сурет: Wikimedia Commons",
-            7.85,
-            6.95,
-            5.0,
-            0.3,
-            font_size=8,
-        )
+        elif layout_no == 2:
+            # FULL IMAGE — сурет басым, төменде мәтіндік панель
+            rect(slide, 0, 0, 13.333, 7.5, NAVY)
+            if image:
+                add_image_safely(slide, image["stream"], 0, 0, 13.333, 7.5)
+                rect(slide, 0, 4.75, 13.333, 2.75, NAVY)
+            else:
+                rect(slide, 0, 0, 13.333, 7.5, NAVY)
+            add_text_box(slide, stitle, .75, 5.05, 8.9, .75, 28, True, WHITE)
+            short = "  •  ".join(bullets[:2]) if bullets else "Тақырып бойынша негізгі түсініктер мен маңызды тұжырымдар."
+            add_text_box(slide, short, .78, 5.95, 11.3, .85, 15, False, (225, 230, 240))
+            if image:
+                add_text_box(slide, "Wikimedia Commons", 10.2, 6.95, 2.3, .25, 8, False, WHITE, align=PP_ALIGN.RIGHT)
+            add_number(slide, idx, WHITE)
 
-    # -------------------------
-    # CONTENT SLIDES
-    # -------------------------
-    for item in slides:
-        slide = prs.slides.add_slide(
-            prs.slide_layouts[6]
-        )
+        else:
+            # EDITORIAL — үлкен сан + мәтін + кішкентай сурет
+            rect(slide, 0, 0, 13.333, 7.5, (249, 250, 253))
+            add_text_box(slide, f"{idx:02d}", .7, .7, 2.0, 1.3, 48, True, accent)
+            add_text_box(slide, stitle, 2.35, .85, 6.9, 1.0, 28, True, INK)
+            rect(slide, .75, 2.0, 7.3, .04, accent)
+            add_bullets(slide, bullets, .8, 2.45, 6.9, 3.7, 18)
+            if image:
+                rect(slide, 8.65, 1.35, 3.9, 4.95, WHITE, True)
+                add_image_safely(slide, image["stream"], 8.82, 1.52, 3.56, 4.58)
+                add_text_box(slide, "Wikimedia Commons", 9.05, 6.2, 3.0, .25, 8, False, MUTED, align=PP_ALIGN.RIGHT)
+            add_number(slide, idx, accent)
 
-        # Modern clean background and accent bar
-        from pptx.dml.color import RGBColor
-        from pptx.enum.shapes import MSO_SHAPE
-        bg = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(13.333), Inches(7.5))
-        bg.fill.solid(); bg.fill.fore_color.rgb = RGBColor(245, 247, 251); bg.line.fill.background()
-        bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0), Inches(0), Inches(0.14), Inches(7.5))
-        bar.fill.solid(); bar.fill.fore_color.rgb = RGBColor(67, 97, 238); bar.line.fill.background()
-
-        slide_title = str(
-            item.get("title", "")
-        )
-
-        bullets = item.get(
-            "bullets",
-            []
-        )
-
-        # Слайдтың тақырыбы мен мәтіні бойынша жеке сурет іздейміз.
-        image_result = find_slide_image(
-            title,
-            slides_data.get("subject", ""),
-            slide_title,
-            " ".join(str(x) for x in bullets[:2]),
-            used_urls=used_image_urls,
-        )
-
-        # Title
-        add_text_box(
-            slide,
-            slide_title,
-            0.65,
-            0.45,
-            8.0,
-            0.7,
-            font_size=25,
-            bold=True,
-        )
-
-        # Text area
-        text_left = 0.75
-        text_width = 7.2
-
-        if image_result:
-            text_width = 7.0
-
-        bullet_box = slide.shapes.add_textbox(
-            Inches(text_left),
-            Inches(1.45),
-            Inches(text_width),
-            Inches(5.2),
-        )
-
-        tf = bullet_box.text_frame
-        tf.word_wrap = True
-        tf.margin_left = Inches(0.05)
-        tf.margin_right = Inches(0.05)
-
-        for index, bullet in enumerate(bullets):
-            p = (
-                tf.paragraphs[0]
-                if index == 0
-                else tf.add_paragraph()
-            )
-
-            p.text = str(bullet)
-            p.font.size = Pt(19)
-            p.level = 0
-            p.space_after = Pt(10)
-
-        # Image
-        if image_result:
-            add_image_safely(
-                slide,
-                image_result["stream"],
-                8.35,
-                1.45,
-                4.35,
-                4.75,
-            )
-
-            add_text_box(
-                slide,
-                "Сурет: Wikimedia Commons",
-                8.4,
-                6.25,
-                4.2,
-                0.3,
-                font_size=8,
-            )
-
-        # Footer
-        add_text_box(
-            slide,
-            "Tapsyrys AI",
-            0.75,
-            7.0,
-            2.0,
-            0.25,
-            font_size=8,
-        )
-
-    # Save
     out_dir = Path("generated")
     out_dir.mkdir(exist_ok=True)
-
-    path = (
-        out_dir
-        / f"presentation_{order_id}.pptx"
-    )
-
+    path = out_dir / f"presentation_{order_id}.pptx"
     prs.save(path)
-
     return path
 
 
