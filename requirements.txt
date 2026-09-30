@@ -1,2 +1,4 @@
 Flask
+requests
+python-pptx
 gunicorn
