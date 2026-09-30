@@ -1,22 +1,26 @@
 import base64
 import hashlib
 import html
+import io
 import json
 import os
+import re
 import secrets
 import sqlite3
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import re
 from pathlib import Path
 
-from flask import Flask, redirect, request, make_response
+from flask import Flask, redirect, request, make_response, send_file
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 
+# =========================
+# CANVA OAUTH
+# =========================
 CLIENT_ID = os.environ.get("CANVA_CLIENT_ID")
 CLIENT_SECRET = os.environ.get("CANVA_CLIENT_SECRET")
 
@@ -32,14 +36,25 @@ SCOPES = "design:content:read design:meta:read profile:read"
 
 STATE_TTL = 600
 DB_PATH = os.environ.get("DB_PATH", "app.db")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 
-PRESENTATION_PRICE_PER_SLIDE = 60
+# =========================
+# APP SETTINGS
+# =========================
+SERVICES = {
+    "Презентация": {"type": "page", "price": 60},
+}
+
+MAX_SLIDES = 30
+
+# Wikimedia Commons API:
+# API key қажет емес.
+WIKIMEDIA_API = "https://commons.wikimedia.org/w/api.php"
+USER_AGENT = "TapsyrysAI/1.0 (educational presentation generator)"
 
 
-# ---------- DB ----------
-
+# =========================
+# DATABASE
+# =========================
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -55,6 +70,7 @@ def init_db():
                 created_at REAL NOT NULL
             )
         """)
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS canva_tokens (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,6 +81,7 @@ def init_db():
                 created_at REAL NOT NULL
             )
         """)
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS customers (
                 customer_id TEXT PRIMARY KEY,
@@ -73,6 +90,15 @@ def init_db():
                 created_at REAL NOT NULL
             )
         """)
+
+        try:
+            conn.execute(
+                "ALTER TABLE customers "
+                "ADD COLUMN presentation_free_used INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,7 +124,11 @@ def save_state(state, code_verifier):
             (time.time() - STATE_TTL,),
         )
         conn.execute(
-            "INSERT INTO oauth_states (state, code_verifier, created_at) VALUES (?, ?, ?)",
+            """
+            INSERT INTO oauth_states
+            (state, code_verifier, created_at)
+            VALUES (?, ?, ?)
+            """,
             (state, code_verifier, time.time()),
         )
 
@@ -106,18 +136,26 @@ def save_state(state, code_verifier):
 def pop_state(state):
     with db() as conn:
         row = conn.execute(
-            "SELECT code_verifier, created_at FROM oauth_states WHERE state = ?",
+            "SELECT code_verifier, created_at "
+            "FROM oauth_states WHERE state = ?",
             (state,),
         ).fetchone()
-        conn.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
+
+        conn.execute(
+            "DELETE FROM oauth_states WHERE state = ?",
+            (state,),
+        )
+
     if not row or time.time() - row["created_at"] > STATE_TTL:
         return None
+
     return row["code_verifier"]
 
 
 def save_tokens(token_data):
     expires_in = token_data.get("expires_in")
     expires_at = time.time() + expires_in if expires_in else None
+
     with db() as conn:
         conn.execute(
             """
@@ -137,17 +175,20 @@ def save_tokens(token_data):
 
 def get_customer(customer_id):
     with db() as conn:
-        row = conn.execute(
+        return conn.execute(
             "SELECT * FROM customers WHERE customer_id = ?",
             (customer_id,),
         ).fetchone()
-    return row
 
 
 def ensure_customer(customer_id):
     with db() as conn:
         conn.execute(
-            "INSERT OR IGNORE INTO customers (customer_id, free_used, presentation_free_used, created_at) VALUES (?, 0, 0, ?)",
+            """
+            INSERT OR IGNORE INTO customers
+            (customer_id, free_used, presentation_free_used, created_at)
+            VALUES (?, 0, 0, ?)
+            """,
             (customer_id, time.time()),
         )
 
@@ -158,8 +199,10 @@ def create_customer():
 
 def calculate_price(service, quantity):
     item = SERVICES[service]
+
     if item["type"] == "fixed":
         return item["price"]
+
     return item["price"] * max(1, quantity)
 
 
@@ -170,97 +213,652 @@ def customer_id_from_request():
 init_db()
 
 
-# ---------- AI PRESENTATION GENERATOR ----------
+# =========================
+# LOCAL PRESENTATION CONTENT
+# =========================
+def make_local_slides(topic, subject, quantity):
+    """
+    OpenAI API қолданбай презентация мазмұнын құрады.
+    """
 
-def call_ai_for_slides(topic, subject, quantity):
-    """Create slide content with an OpenAI-compatible API."""
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY Render Environment Variable орнатылмаған.")
+    quantity = max(1, min(int(quantity), MAX_SLIDES))
 
-    quantity = max(1, min(int(quantity), 30))
-    prompt = f"""Қазақ тілінде оқу үшін презентация дайында.
-Пәні: {subject or 'көрсетілмеген'}
-Тақырыбы: {topic}
-Слайд саны: {quantity}
+    topic = re.sub(
+        r"\s+",
+        " ",
+        (topic or "Тақырып").strip()
+    )
 
-Тек JSON қайтар. Формат:
-{{"title":"...","slides":[{{"title":"...","bullets":["...","..."]}}]}}
-Әр слайдта 3-5 қысқа, түсінікті тармақ болсын. Кіріспе, негізгі бөлім және қорытынды логикасы сақталсын. Артық түсіндірме жазба."""
+    subject = re.sub(
+        r"\s+",
+        " ",
+        (subject or "Пән").strip()
+    )
 
-    payload = {
-        "model": OPENAI_MODEL,
-        "input": prompt,
-        "temperature": 0.4,
+    stop_words = {
+        "және", "мен", "үшін", "туралы", "бойынша",
+        "негіздері", "негізі", "кіріспе", "тақырыбы",
+        "пәні", "пән", "the", "and", "of", "in",
+        "на", "и", "для", "по", "о"
     }
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    words = re.findall(
+        r"[A-Za-zА-Яа-яӘәҒғҚқҢңӨөҰұҮүҺһІі0-9-]{3,}",
+        topic.lower()
+    )
+
+    keywords = [
+        word for word in words
+        if word not in stop_words
+    ]
+
+    if not keywords:
+        keywords = [topic]
+
+    main_keyword = keywords[0]
+    keyword_text = ", ".join(keywords[:4])
+
+    subject_context = {
+        "Философия":
+            "ұғымдардың мәнін, себеп-салдарын және дүниетанымдық маңызын",
+        "Психология":
+            "адамның мінез-құлқы, ойлауы және эмоциялық ерекшеліктері тұрғысынан",
+        "Социология":
+            "қоғам, әлеуметтік топтар және қоғамдық байланыстар тұрғысынан",
+        "Саясаттану":
+            "саяси үдерістер, институттар және қоғамдық қатынастар тұрғысынан",
+        "Тарих":
+            "тарихи кезеңдер, оқиғалар және олардың себеп-салдары тұрғысынан",
+        "Экология":
+            "қоршаған орта, табиғи ресурстар және тұрақты даму тұрғысынан",
+        "Физика":
+            "физикалық құбылыстар, заңдылықтар және практикалық қолданылуы тұрғысынан",
+        "Информатика":
+            "ақпараттық технологиялар, алгоритмдер және цифрлық шешімдер тұрғысынан",
+    }
+
+    context = subject_context.get(
+        subject,
+        f"{subject} пәні аясында"
+    )
+
+    sections = [
+        (
+            "Кіріспе",
+            [
+                f"{topic} — {subject} пәніндегі маңызды тақырыптардың бірі.",
+                f"Бұл презентацияда {main_keyword} ұғымы және оның негізгі қырлары қарастырылады.",
+                "Негізгі мақсат: тақырыпты түсінікті түрде ашып көрсету.",
+            ],
+        ),
+        (
+            "Негізгі ұғымдар",
+            [
+                f"{topic} бойынша негізгі түсініктер мен терминдер қарастырылады.",
+                f"Негізгі сөздер: {keyword_text}.",
+                "Терминдерді дұрыс түсіну тақырыпты әрі қарай талдауға мүмкіндік береді.",
+            ],
+        ),
+        (
+            "Тақырыптың мақсаты",
+            [
+                f"{topic} мазмұнын жүйелі түрде түсіндіру.",
+                f"Негізгі мәселелерді {context} талдау.",
+                "Теориялық ақпаратты практикалық мысалдармен байланыстыру.",
+            ],
+        ),
+        (
+            "Тарихы және қалыптасуы",
+            [
+                f"{topic} түсінігінің қалыптасуына әртүрлі ғылыми және қоғамдық факторлар әсер етеді.",
+                "Уақыт өте келе тақырыптың мазмұны кеңейіп, жаңа бағыттар пайда болды.",
+                "Қазіргі түсінікті қалыптастыруда зерттеулердің маңызы жоғары.",
+            ],
+        ),
+        (
+            "Негізгі ерекшеліктері",
+            [
+                f"{topic} тақырыбының басты ерекшеліктері оның құрылымы мен мазмұнынан көрінеді.",
+                f"Маңызды аспектілер: {keyword_text}.",
+                "Әр ерекшелік тақырыпты толық түсінуге көмектеседі.",
+            ],
+        ),
+        (
+            "Құрылымы",
+            [
+                f"{topic} бірнеше өзара байланысты элементтен тұрады.",
+                "Элементтер бір-біріне әсер етіп, жалпы жүйені қалыптастырады.",
+                "Құрылымдық байланыстарды түсіну практикалық талдау үшін маңызды.",
+            ],
+        ),
+        (
+            "Негізгі мәселелер",
+            [
+                f"{topic} бойынша шешімін қажет ететін бірнеше мәселе бар.",
+                "Мәселелердің пайда болуына әлеуметтік, ғылыми немесе практикалық факторлар әсер етуі мүмкін.",
+                "Оларды шешу үшін нақты жағдайды жан-жақты талдау қажет.",
+            ],
+        ),
+        (
+            "Артықшылықтары",
+            [
+                f"{topic} қолданылуы немесе зерттелуі бірқатар пайдалы нәтиже береді.",
+                "Негізгі артықшылықтары тиімділік, түсініктілік және практикалық маңызбен байланысты.",
+                "Артықшылықтар нақты жағдайға қарай өзгеруі мүмкін.",
+            ],
+        ),
+        (
+            "Кемшіліктері мен шектеулері",
+            [
+                "Кез келген бағыттың белгілі бір шектеулері болады.",
+                f"{topic} бойынша ақпаратты қолданғанда жағдайдың ерекшеліктерін ескеру қажет.",
+                "Шектеулерді дұрыс бағалау қате қорытынды жасаудан сақтайды.",
+            ],
+        ),
+        (
+            "Практикалық қолданылуы",
+            [
+                f"{topic} теориямен ғана шектелмей, практикада да қолданылуы мүмкін.",
+                f"Оны {context} қарастыруға болады.",
+                "Практикалық мысалдар тақырыпты жақсы түсінуге мүмкіндік береді.",
+            ],
+        ),
+        (
+            "Мысал",
+            [
+                f"{topic} бойынша қарапайым мысал ретінде күнделікті өмірдегі нақты жағдайды алуға болады.",
+                f"Мысалда {main_keyword} қалай көрінетіні көрсетіледі.",
+                "Мысалды талдау теориялық түсінікті бекітеді.",
+            ],
+        ),
+        (
+            "Қазіргі кездегі маңызы",
+            [
+                f"Бүгінгі таңда {topic} тақырыбының өзектілігі сақталып отыр.",
+                "Жаңа технологиялар мен қоғамдық өзгерістер тақырыпқа жаңа талаптар қояды.",
+                "Сондықтан мәселені қазіргі жағдаймен байланыстырып қарастыру маңызды.",
+            ],
+        ),
+        (
+            "Қорытынды",
+            [
+                f"{topic} — зерттеуге және түсінуге маңызды тақырып.",
+                "Негізгі ұғымдар мен ерекшеліктерді жүйелеу тақырыптың мәнін ашады.",
+                "Тақырыпты практикамен байланыстыру оның маңызын нақты көрсетеді.",
+            ],
+        ),
+        (
+            "Пайдаланылған әдебиеттер",
+            [
+                "Пән бойынша оқу құралдары мен дәріс материалдары.",
+                "Ғылыми мақалалар мен оқу әдебиеттері.",
+                "Ресми және электрондық ақпараттық ресурстар.",
+            ],
+        ),
+    ]
+
+    if quantity == 1:
+        selected = [
+            (
+                "Презентация",
+                [
+                    f"Тақырып: {topic}",
+                    f"Пән: {subject}",
+                    "Негізгі мазмұн қысқаша берілді.",
+                ],
+            )
+        ]
+
+    elif quantity < len(sections):
+        selected = sections[:quantity]
+
+        if quantity >= 3:
+            selected[-1] = sections[-2]
+
+    else:
+        selected = list(sections)
+        extra_index = 1
+
+        while len(selected) < quantity:
+            selected.insert(
+                -1,
+                (
+                    f"Қосымша талдау {extra_index}",
+                    [
+                        f"{topic} тақырыбындағы {main_keyword} ұғымына қосымша талдау.",
+                        f"Бұл бөлім {subject} пәнімен байланысты мәселелерді нақтылайды.",
+                        "Нақты мысалдар мен деректерді қосу презентацияны толықтырады.",
+                    ],
+                ),
+            )
+            extra_index += 1
+
+    return {
+        "title": topic,
+        "slides": [
+            {
+                "title": title,
+                "bullets": bullets,
+            }
+            for title, bullets in selected
+        ],
+    }
+
+
+# =========================
+# WIKIMEDIA COMMONS IMAGES
+# =========================
+def clean_search_text(text):
+    text = re.sub(r"[^\w\sӘәҒғҚқҢңӨөҰұҮүҺһІі-]", " ", text or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def search_wikimedia_image(query):
+    """
+    Wikimedia Commons-тен тегін сурет іздейді.
+    API key қажет емес.
+
+    Әр сурет үшін:
+    - image URL
+    - page URL
+    - title
+    қайтарылады.
+    """
+
+    query = clean_search_text(query)
+
+    if not query:
+        return None
+
+    params = {
+        "action": "query",
+        "generator": "search",
+        "gsrsearch": query,
+        "gsrnamespace": "6",
+        "gsrlimit": "8",
+        "prop": "imageinfo",
+        "iiprop": "url",
+        "iiurlwidth": "1200",
+        "format": "json",
+        "formatversion": "2",
+    }
+
+    url = WIKIMEDIA_API + "?" + urllib.parse.urlencode(params)
+
     req = urllib.request.Request(
-        "https://api.openai.com/v1/responses",
-        data=data,
-        method="POST",
+        url,
         headers={
-            "Authorization": "Bearer " + OPENAI_API_KEY,
-            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
         },
     )
-    with urllib.request.urlopen(req, timeout=90) as response:
-        result = json.loads(response.read().decode("utf-8"))
 
-    text_out = result.get("output_text", "").strip()
-    if not text_out:
-        # fallback for Responses API output structure
-        chunks = []
-        for item in result.get("output", []):
-            for c in item.get("content", []):
-                if c.get("type") == "output_text":
-                    chunks.append(c.get("text", ""))
-        text_out = "".join(chunks).strip()
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            data = json.loads(
+                response.read().decode("utf-8")
+            )
 
-    text_out = re.sub(r"^```json\s*|\s*```$", "", text_out, flags=re.I)
-    return json.loads(text_out)
+        pages = data.get("query", {}).get("pages", [])
+
+        for page in pages:
+            imageinfo = page.get("imageinfo", [])
+
+            if not imageinfo:
+                continue
+
+            info = imageinfo[0]
+
+            image_url = (
+                info.get("thumburl")
+                or info.get("url")
+            )
+
+            if not image_url:
+                continue
+
+            title = page.get("title", "Wikimedia Commons")
+
+            return {
+                "image_url": image_url,
+                "page_url": (
+                    "https://commons.wikimedia.org/wiki/"
+                    + urllib.parse.quote(
+                        title.replace(" ", "_"),
+                        safe="_:/"
+                    )
+                ),
+                "title": title,
+            }
+
+    except Exception:
+        return None
+
+    return None
+
+
+def download_image(image_url):
+    """
+    Суретті жадыға жүктейді.
+    Дискке уақытша сурет сақтамайды.
+    """
+
+    req = urllib.request.Request(
+        image_url,
+        headers={
+            "User-Agent": USER_AGENT,
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            data = response.read()
+
+        if not data or len(data) < 1000:
+            return None
+
+        return io.BytesIO(data)
+
+    except Exception:
+        return None
+
+
+def find_slide_image(topic, subject, slide_title):
+    """
+    Алдымен тақырып + слайд атауы бойынша іздейді.
+    Табылмаса topic + subject бойынша іздейді.
+    """
+
+    queries = [
+        f"{topic} {slide_title}",
+        f"{subject} {topic}",
+        topic,
+        subject,
+    ]
+
+    used = set()
+
+    for query in queries:
+        query = clean_search_text(query)
+
+        if not query or query.lower() in used:
+            continue
+
+        used.add(query.lower())
+
+        result = search_wikimedia_image(query)
+
+        if not result:
+            continue
+
+        image_stream = download_image(
+            result["image_url"]
+        )
+
+        if image_stream:
+            return {
+                **result,
+                "stream": image_stream,
+            }
+
+    return None
+
+
+# =========================
+# POWERPOINT
+# =========================
+def add_text_box(slide, text, left, top, width, height,
+                 font_size=18, bold=False):
+    from pptx.util import Inches, Pt
+
+    box = slide.shapes.add_textbox(
+        Inches(left),
+        Inches(top),
+        Inches(width),
+        Inches(height),
+    )
+
+    tf = box.text_frame
+    tf.word_wrap = True
+    tf.margin_left = Inches(0.05)
+    tf.margin_right = Inches(0.05)
+    tf.margin_top = Inches(0.03)
+    tf.margin_bottom = Inches(0.03)
+
+    p = tf.paragraphs[0]
+    p.text = text
+    p.font.size = Pt(font_size)
+    p.font.bold = bold
+
+    return box
+
+
+def add_image_safely(slide, image_stream, left, top, width, height):
+    """
+    Суретті слайдқа қосады.
+    Сурет қосылмаса, презентация тоқтамайды.
+    """
+
+    from pptx.util import Inches
+
+    try:
+        image_stream.seek(0)
+
+        slide.shapes.add_picture(
+            image_stream,
+            Inches(left),
+            Inches(top),
+            width=Inches(width),
+            height=Inches(height),
+        )
+
+        return True
+
+    except Exception:
+        return False
 
 
 def make_pptx(slides_data, order_id):
-    """Build a PPTX file from generated slide content."""
+    """
+    PPTX жасайды.
+    Әр слайдқа Wikimedia Commons-тен тегін сурет іздейді.
+    """
+
     try:
         from pptx import Presentation
         from pptx.util import Inches, Pt
     except ImportError:
-        raise RuntimeError("python-pptx орнатылмаған. requirements.txt ішіне python-pptx қосыңыз.")
+        raise RuntimeError(
+            "python-pptx орнатылмаған. "
+            "requirements.txt ішіне python-pptx қосыңыз."
+        )
 
     prs = Presentation()
+
     prs.slide_width = Inches(13.333)
     prs.slide_height = Inches(7.5)
 
-    title = slides_data.get("title", "Презентация")
-    slides = slides_data.get("slides", [])
+    title = slides_data.get(
+        "title",
+        "Презентация"
+    )
 
-    # Title slide
-    slide = prs.slides.add_slide(prs.slide_layouts[0])
-    slide.shapes.title.text = title
-    if slide.placeholders[1]:
-        slide.placeholders[1].text = "Tapsyrys AI"
+    slides = slides_data.get(
+        "slides",
+        []
+    )
 
+    # -------------------------
+    # TITLE SLIDE
+    # -------------------------
+    slide = prs.slides.add_slide(
+        prs.slide_layouts[6]
+    )
+
+    title_image = find_slide_image(
+        title,
+        "",
+        "cover"
+    )
+
+    if title_image:
+        add_image_safely(
+            slide,
+            title_image["stream"],
+            7.7,
+            0,
+            5.63,
+            7.5,
+        )
+
+    add_text_box(
+        slide,
+        title,
+        0.7,
+        2.2,
+        6.4,
+        1.5,
+        font_size=30,
+        bold=True,
+    )
+
+    add_text_box(
+        slide,
+        "Tapsyrys AI",
+        0.7,
+        4.0,
+        5.5,
+        0.6,
+        font_size=20,
+    )
+
+    if title_image:
+        add_text_box(
+            slide,
+            "Сурет: Wikimedia Commons",
+            7.85,
+            6.95,
+            5.0,
+            0.3,
+            font_size=8,
+        )
+
+    # -------------------------
+    # CONTENT SLIDES
+    # -------------------------
     for item in slides:
-        slide = prs.slides.add_slide(prs.slide_layouts[1])
-        slide.shapes.title.text = str(item.get("title", ""))
-        tf = slide.placeholders[1].text_frame
-        tf.clear()
-        bullets = item.get("bullets", [])
-        for i, bullet in enumerate(bullets):
-            p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
-            p.text = str(bullet)
-            p.font.size = Pt(22)
-            p.level = 0
+        slide = prs.slides.add_slide(
+            prs.slide_layouts[6]
+        )
 
+        slide_title = str(
+            item.get("title", "")
+        )
+
+        bullets = item.get(
+            "bullets",
+            []
+        )
+
+        image_result = find_slide_image(
+            title,
+            "",
+            slide_title
+        )
+
+        # Title
+        add_text_box(
+            slide,
+            slide_title,
+            0.65,
+            0.45,
+            8.0,
+            0.7,
+            font_size=25,
+            bold=True,
+        )
+
+        # Text area
+        text_left = 0.75
+        text_width = 7.2
+
+        if image_result:
+            text_width = 7.0
+
+        bullet_box = slide.shapes.add_textbox(
+            Inches(text_left),
+            Inches(1.45),
+            Inches(text_width),
+            Inches(5.2),
+        )
+
+        tf = bullet_box.text_frame
+        tf.word_wrap = True
+        tf.margin_left = Inches(0.05)
+        tf.margin_right = Inches(0.05)
+
+        for index, bullet in enumerate(bullets):
+            p = (
+                tf.paragraphs[0]
+                if index == 0
+                else tf.add_paragraph()
+            )
+
+            p.text = str(bullet)
+            p.font.size = Pt(19)
+            p.level = 0
+            p.space_after = Pt(10)
+
+        # Image
+        if image_result:
+            add_image_safely(
+                slide,
+                image_result["stream"],
+                8.35,
+                1.45,
+                4.35,
+                4.75,
+            )
+
+            add_text_box(
+                slide,
+                "Сурет: Wikimedia Commons",
+                8.4,
+                6.25,
+                4.2,
+                0.3,
+                font_size=8,
+            )
+
+        # Footer
+        add_text_box(
+            slide,
+            "Tapsyrys AI",
+            0.75,
+            7.0,
+            2.0,
+            0.25,
+            font_size=8,
+        )
+
+    # Save
     out_dir = Path("generated")
     out_dir.mkdir(exist_ok=True)
-    path = out_dir / f"presentation_{order_id}.pptx"
+
+    path = (
+        out_dir
+        / f"presentation_{order_id}.pptx"
+    )
+
     prs.save(path)
+
     return path
 
 
-# ---------- HTML ----------
-
+# =========================
+# HTML
+# =========================
 def layout(title, body):
     return f"""<!doctype html>
 <html lang="kk">
@@ -268,39 +866,132 @@ def layout(title, body):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{html.escape(title)}</title>
+
 <style>
-body{{margin:0;background:#f5f7fb;font-family:Arial,sans-serif;color:#222}}
-.box{{max-width:650px;margin:35px auto;padding:28px;background:#fff;border-radius:20px;box-shadow:0 5px 25px rgba(0,0,0,.08)}}
-h1,h2{{margin-top:0}}
-label{{display:block;margin:14px 0 6px;font-weight:600}}
-input,select,textarea{{width:100%;box-sizing:border-box;padding:12px;border:1px solid #ddd;border-radius:10px;font-size:16px}}
-textarea{{min-height:100px;resize:vertical}}
-button,.button{{display:inline-block;border:0;margin-top:18px;padding:13px 20px;background:#7c3aed;color:#fff;border-radius:10px;font-size:16px;text-decoration:none;cursor:pointer}}
-.secondary{{background:#555}}
-.price{{font-size:24px;font-weight:bold;margin:18px 0}}
-.free{{color:#138a3d;font-weight:bold}}
-.note{{background:#f2efff;padding:12px;border-radius:10px;margin:15px 0}}
-.error{{background:#ffecec;padding:12px;border-radius:10px;color:#a00}}
-.row{{display:flex;gap:10px}}
-.row>*{{flex:1}}
+body {{
+    margin: 0;
+    background: #f5f7fb;
+    font-family: Arial, sans-serif;
+    color: #222;
+}}
+
+.box {{
+    max-width: 650px;
+    margin: 35px auto;
+    padding: 28px;
+    background: #fff;
+    border-radius: 20px;
+    box-shadow: 0 5px 25px rgba(0,0,0,.08);
+}}
+
+h1, h2 {{
+    margin-top: 0;
+}}
+
+label {{
+    display: block;
+    margin: 14px 0 6px;
+    font-weight: 600;
+}}
+
+input, select, textarea {{
+    width: 100%;
+    box-sizing: border-box;
+    padding: 12px;
+    border: 1px solid #ddd;
+    border-radius: 10px;
+    font-size: 16px;
+}}
+
+textarea {{
+    min-height: 100px;
+    resize: vertical;
+}}
+
+button, .button {{
+    display: inline-block;
+    border: 0;
+    margin-top: 18px;
+    padding: 13px 20px;
+    background: #7c3aed;
+    color: #fff;
+    border-radius: 10px;
+    font-size: 16px;
+    text-decoration: none;
+    cursor: pointer;
+}}
+
+.secondary {{
+    background: #555;
+}}
+
+.price {{
+    font-size: 24px;
+    font-weight: bold;
+    margin: 18px 0;
+}}
+
+.free {{
+    color: #138a3d;
+    font-weight: bold;
+}}
+
+.note {{
+    background: #f2efff;
+    padding: 12px;
+    border-radius: 10px;
+    margin: 15px 0;
+}}
+
+.error {{
+    background: #ffecec;
+    padding: 12px;
+    border-radius: 10px;
+    color: #a00;
+}}
+
+.row {{
+    display: flex;
+    gap: 10px;
+}}
+
+.row > * {{
+    flex: 1;
+}}
+
+small {{
+    color: #666;
+}}
 </style>
 </head>
-<body><div class="box">{body}</div></body></html>"""
+
+<body>
+<div class="box">
+{body}
+</div>
+</body>
+</html>"""
 
 
 def page(title, body, status=200):
     return layout(title, body), status
 
 
-# ---------- Main ----------
-
+# =========================
+# HOME
+# =========================
 @app.route("/")
 def home():
     customer_id = customer_id_from_request()
+
     if not customer_id:
         customer_id = create_customer()
         ensure_customer(customer_id)
-        resp = make_response(_home_html(customer_id))
+
+        resp = make_response(
+            _home_html(customer_id)
+        )
+
         resp.set_cookie(
             "tapsyrys_customer_id",
             customer_id,
@@ -309,300 +1000,692 @@ def home():
             samesite="Lax",
             secure=True,
         )
+
         return resp
 
     ensure_customer(customer_id)
+
     return _home_html(customer_id)
 
 
 def _home_html(customer_id):
     customer = get_customer(customer_id)
-    presentation_free_available = not customer["presentation_free_used"]
 
-    if presentation_free_available:
-        free_text = '<div class="note free">🎁 Сізге 1 тегін AI презентация жасау мүмкіндігі берілді!</div>'
-        initial_price = "0 тг — 1 тегін AI презентация 🎁"
-    else:
-        free_text = '<div class="note">Тегін AI презентация мүмкіндігі қолданылды. Келесі презентация — 60 тг/слайд.</div>'
-        initial_price = "600 тг"
+    presentation_free_available = not bool(
+        customer["presentation_free_used"]
+    )
 
-    return layout("Tapsyrys AI", f"""
+    options = "".join(
+        f'<option value="{html.escape(name)}">'
+        f'{html.escape(name)}</option>'
+        for name in SERVICES
+    )
+
+    free_text = (
+        '<div class="note free">'
+        '🎁 1 тегін презентация жасау мүмкіндігі бар!'
+        '</div>'
+        if presentation_free_available
+        else
+        '<div class="note">'
+        '🎁 Тегін мүмкіндік қолданылды. '
+        'Келесі презентациялар — 60 тг/слайд.'
+        '</div>'
+    )
+
+    return layout(
+        "Tapsyrys AI",
+        f"""
 <h1>Tapsyrys AI 🚀</h1>
-<p>AI арқылы презентация жасаңыз.</p>
+
+<p>
+Тақырыпты енгізіңіз — бірінші презентация тегін 🎁
+</p>
+
 {free_text}
 
 <form method="post" action="/order">
-<input type="hidden" name="service" value="Презентация">
+
+<label>Қызмет</label>
+
+<select
+    name="service"
+    id="service"
+    onchange="updatePrice()"
+    required
+>
+{options}
+</select>
 
 <label>Пән</label>
-<input name="subject" placeholder="Мысалы: Философия">
 
-<label>Презентация тақырыбы</label>
-<textarea name="topic" placeholder="Мысалы: Болмыс және таным" required></textarea>
+<input
+    name="subject"
+    placeholder="Мысалы: Философия"
+>
+
+<label>Тақырып</label>
+
+<textarea
+    name="topic"
+    placeholder="Мысалы: Болмыс және таным"
+    required
+></textarea>
 
 <label>Слайд саны</label>
-<input name="quantity" id="quantity" type="number" min="1" max="30" value="10" oninput="updatePrice()" required>
+
+<input
+    name="quantity"
+    id="quantity"
+    type="number"
+    min="1"
+    max="{MAX_SLIDES}"
+    value="10"
+    oninput="updatePrice()"
+>
 
 <div class="row">
+
 <div>
 <label>Күні</label>
 <input name="due_date" type="date">
 </div>
+
 <div>
 <label>Уақыты</label>
 <input name="due_time" type="time">
 </div>
+
 </div>
 
-<div class="price" id="price">Бағасы: {initial_price}</div>
-<button type="submit">Презентация жасау ✨</button>
+<div class="price" id="price">
+Бағасы: 0 тг
+</div>
+
+<button type="submit">
+Тапсырыс беру
+</button>
+
 </form>
 
 <hr style="margin:25px 0">
-<a class="button secondary" href="/canva/login">Canva-ға кіру</a>
+
+<a
+    class="button secondary"
+    href="/canva/login"
+>
+Canva аккаунтын қосу
+</a>
+
+<p>
+<small>
+Суреттер автоматты түрде Wikimedia Commons-тен
+тегін түрде ізделеді.
+</small>
+</p>
 
 <script>
-const freeAvailable = {str(presentation_free_available).lower()};
+const services =
+    {json.dumps(SERVICES, ensure_ascii=False)};
+
+const presentationFreeAvailable =
+    {str(presentation_free_available).lower()};
+
 function updatePrice() {{
-    const quantity = Math.max(1, Math.min(30, parseInt(document.getElementById("quantity").value || "1")));
-    if (freeAvailable) {{
-        document.getElementById("price").innerHTML = 'Бағасы: <span class="free">0 тг — 1 тегін AI презентация 🎁</span>';
+    const service =
+        document.getElementById("service").value;
+
+    const quantity =
+        Math.max(
+            1,
+            parseInt(
+                document.getElementById("quantity").value || "1"
+            )
+        );
+
+    let price =
+        services[service].price;
+
+    if (services[service].type !== "fixed") {{
+        price *= quantity;
+    }}
+
+    if (
+        service === "Презентация"
+        && presentationFreeAvailable
+    ) {{
+        document.getElementById("price").innerHTML =
+            'Бағасы: <span class="free">'
+            + '0 тг — бірінші презентация тегін 🎁'
+            + '</span>';
     }} else {{
-        document.getElementById("price").textContent = "Бағасы: " + (quantity * 60) + " тг";
+        document.getElementById("price").textContent =
+            "Бағасы: " + price + " тг";
     }}
 }}
+
 updatePrice();
 </script>
-""")
+""",
+    )
 
 
-# ---------- Orders / test payment ----------
-
+# =========================
+# ORDER
+# =========================
 @app.route("/order", methods=["POST"])
 def order():
     customer_id = customer_id_from_request()
+
     if not customer_id:
         return redirect("/")
 
     ensure_customer(customer_id)
 
-    subject = request.form.get("subject", "").strip()
-    topic = request.form.get("topic", "").strip()
-    due_date = request.form.get("due_date", "")
-    due_time = request.form.get("due_time", "")
+    service = request.form.get(
+        "service",
+        ""
+    )
+
+    subject = request.form.get(
+        "subject",
+        ""
+    ).strip()
+
+    topic = request.form.get(
+        "topic",
+        ""
+    ).strip()
+
+    due_date = request.form.get(
+        "due_date",
+        ""
+    )
+
+    due_time = request.form.get(
+        "due_time",
+        ""
+    )
 
     try:
-        quantity = max(1, min(30, int(request.form.get("quantity", "10"))))
+        quantity = max(
+            1,
+            min(
+                MAX_SLIDES,
+                int(
+                    request.form.get(
+                        "quantity",
+                        "1"
+                    )
+                ),
+            ),
+        )
     except ValueError:
-        quantity = 10
+        quantity = 1
 
-    if not topic:
+    if service not in SERVICES or not topic:
         return page(
             "Қате",
-            '<h2>Тақырыпты енгізіңіз ❌</h2><a class="button" href="/">Қайту</a>',
+            """
+<h2>Мәлімет толық емес ❌</h2>
+<a class="button" href="/">Қайту</a>
+""",
             400,
         )
 
     customer = get_customer(customer_id)
-    presentation_free_available = not customer["presentation_free_used"]
-    normal_price = PRESENTATION_PRICE_PER_SLIDE * quantity
-    price = 0 if presentation_free_available else normal_price
+
+    presentation_free_available = (
+        service == "Презентация"
+        and not bool(
+            customer["presentation_free_used"]
+        )
+    )
+
+    normal_price = calculate_price(
+        service,
+        quantity
+    )
+
+    price = (
+        0
+        if presentation_free_available
+        else normal_price
+    )
 
     with db() as conn:
         cur = conn.execute(
             """
             INSERT INTO orders
-            (customer_id, service, subject, topic, quantity, due_date, due_time,
-             price, payment_status, generation_status, created_at)
-            VALUES (?, 'Презентация', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (
+                customer_id,
+                service,
+                subject,
+                topic,
+                quantity,
+                due_date,
+                due_time,
+                price,
+                payment_status,
+                generation_status,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                customer_id, subject, topic, quantity, due_date, due_time,
+                customer_id,
+                service,
+                subject,
+                topic,
+                quantity,
+                due_date,
+                due_time,
                 price,
-                "free" if presentation_free_available else "pending",
-                "unlocked" if presentation_free_available else "locked",
+                (
+                    "free"
+                    if presentation_free_available
+                    else "pending"
+                ),
+                (
+                    "unlocked"
+                    if presentation_free_available
+                    else "locked"
+                ),
                 time.time(),
             ),
         )
+
         order_id = cur.lastrowid
 
         if presentation_free_available:
             conn.execute(
-                "UPDATE customers SET presentation_free_used = 1 WHERE customer_id = ?",
+                """
+                UPDATE customers
+                SET presentation_free_used = 1
+                WHERE customer_id = ?
+                """,
                 (customer_id,),
             )
 
     if presentation_free_available:
-        return redirect(f"/order/{order_id}/generation")
+        return redirect(
+            f"/order/{order_id}/generation"
+        )
 
     return page(
         "Төлем",
         f"""
-<h2>Презентация #{order_id}</h2>
-<p><b>Тақырып:</b> {html.escape(topic)}</p>
-<p><b>Слайд саны:</b> {quantity}</p>
-<div class="price">Төлем: {normal_price} тг</div>
-<div class="note">Бұл әзірге <b>тесттік төлем</b>. Нақты ақша алынбайды.</div>
-<form method="post" action="/order/{order_id}/test-payment">
-<button type="submit">Тест төлемін растау</button>
+<h2>Тапсырыс #{order_id}</h2>
+
+<p>
+<b>Қызмет:</b>
+{html.escape(service)}
+</p>
+
+<p>
+<b>Тақырып:</b>
+{html.escape(topic)}
+</p>
+
+<p>
+<b>Слайд саны:</b>
+{quantity}
+</p>
+
+<div class="price">
+Төлем: {normal_price} тг
+</div>
+
+<div class="note">
+Бұл әзірге <b>тесттік төлем</b>.
+Нақты ақша алынбайды.
+</div>
+
+<form
+    method="post"
+    action="/order/{order_id}/test-payment"
+>
+<button type="submit">
+Тест төлемін растау
+</button>
 </form>
-<a class="button secondary" href="/">Басты бет</a>
+
+<a class="button secondary" href="/">
+Басты бет
+</a>
 """,
     )
 
 
-@app.route("/order/<int:order_id>/test-payment", methods=["POST"])
+@app.route(
+    "/order/<int:order_id>/test-payment",
+    methods=["POST"]
+)
 def test_payment(order_id):
     customer_id = customer_id_from_request()
+
     with db() as conn:
         order = conn.execute(
-            "SELECT * FROM orders WHERE id = ? AND customer_id = ?",
-            (order_id, customer_id),
+            """
+            SELECT *
+            FROM orders
+            WHERE id = ?
+            AND customer_id = ?
+            """,
+            (
+                order_id,
+                customer_id,
+            ),
         ).fetchone()
 
         if not order:
-            return page("Қате", "<h2>Тапсырыс табылмады ❌</h2>", 404)
+            return page(
+                "Қате",
+                "<h2>Тапсырыс табылмады ❌</h2>",
+                404,
+            )
 
         conn.execute(
             """
             UPDATE orders
-            SET payment_status = 'paid', generation_status = 'unlocked'
+            SET payment_status = 'paid',
+                generation_status = 'unlocked'
             WHERE id = ?
             """,
             (order_id,),
         )
 
-    return redirect(f"/order/{order_id}/generation")
+    return redirect(
+        f"/order/{order_id}/generation"
+    )
 
 
+# =========================
+# GENERATION PAGE
+# =========================
 @app.route("/order/<int:order_id>/generation")
 def generation(order_id):
     customer_id = customer_id_from_request()
 
     with db() as conn:
         order = conn.execute(
-            "SELECT * FROM orders WHERE id = ? AND customer_id = ?",
-            (order_id, customer_id),
+            """
+            SELECT *
+            FROM orders
+            WHERE id = ?
+            AND customer_id = ?
+            """,
+            (
+                order_id,
+                customer_id,
+            ),
         ).fetchone()
 
     if not order:
-        return page("Қате", "<h2>Тапсырыс табылмады ❌</h2>", 404)
+        return page(
+            "Қате",
+            "<h2>Тапсырыс табылмады ❌</h2>",
+            404,
+        )
 
     if order["generation_status"] != "unlocked":
         return page(
             "Құлыпталған",
-            "<h2>Генерация жабық 🔒</h2><p>Алдымен төлемді растаңыз.</p>",
+            """
+<h2>Генерация жабық 🔒</h2>
+<p>Алдымен төлемді растаңыз.</p>
+""",
             403,
         )
 
     return page(
         "Генерация",
         f"""
-<h2>Генерация дайын ✨</h2>
-<p><b>Тапсырыс:</b> #{order["id"]}</p>
-<p><b>Қызмет:</b> {html.escape(order["service"])}</p>
-<p><b>Тақырып:</b> {html.escape(order["topic"])}</p>
+<h2>Презентация жасауға дайын ✨</h2>
+
+<p>
+<b>Тапсырыс:</b>
+#{order["id"]}
+</p>
+
+<p>
+<b>Пән:</b>
+{html.escape(order["subject"] or "Көрсетілмеген")}
+</p>
+
+<p>
+<b>Тақырып:</b>
+{html.escape(order["topic"])}
+</p>
+
+<p>
+<b>Слайд:</b>
+{order["quantity"]}
+</p>
 
 <div class="note">
-Бұл батырма әзірге генерация процесінің тесттік кезеңін көрсетеді.
-Canva AI-дың нақты автоматты генерация API-ін бөлек қосу қажет.
+Әр слайдқа тақырыпқа сәйкес
+Wikimedia Commons-тен тегін сурет ізделеді.
+OpenAI API қажет емес.
 </div>
 
-<form method="post" action="/order/{order_id}/generate">
-<button type="submit">Генерация жасау ✨</button>
+<form
+    method="post"
+    action="/order/{order_id}/generate"
+>
+<button type="submit">
+Генерация жасау ✨
+</button>
 </form>
-<a class="button secondary" href="/">Басты бет</a>
+
+<a class="button secondary" href="/">
+Басты бет
+</a>
 """,
     )
 
 
-@app.route("/order/<int:order_id>/generate", methods=["POST"])
+# =========================
+# GENERATE PPTX
+# =========================
+@app.route(
+    "/order/<int:order_id>/generate",
+    methods=["POST"]
+)
 def generate(order_id):
     customer_id = customer_id_from_request()
 
     with db() as conn:
         order = conn.execute(
-            "SELECT * FROM orders WHERE id = ? AND customer_id = ?",
-            (order_id, customer_id),
+            """
+            SELECT *
+            FROM orders
+            WHERE id = ?
+            AND customer_id = ?
+            """,
+            (
+                order_id,
+                customer_id,
+            ),
         ).fetchone()
 
-    if not order or order["generation_status"] != "unlocked":
-        return page("Қате", "<h2>Генерацияға рұқсат жоқ ❌</h2>", 403)
+    if (
+        not order
+        or order["generation_status"] != "unlocked"
+    ):
+        return page(
+            "Қате",
+            "<h2>Генерацияға рұқсат жоқ ❌</h2>",
+            403,
+        )
 
     try:
         with db() as conn:
             conn.execute(
-                "UPDATE orders SET generation_status = 'generating' WHERE id = ?",
+                """
+                UPDATE orders
+                SET generation_status = 'generating'
+                WHERE id = ?
+                """,
                 (order_id,),
             )
 
-        slides_data = call_ai_for_slides(
-            order["topic"], order["subject"], order["quantity"]
+        slides_data = make_local_slides(
+            order["topic"],
+            order["subject"],
+            order["quantity"],
         )
-        pptx_path = make_pptx(slides_data, order_id)
+
+        make_pptx(
+            slides_data,
+            order_id,
+        )
 
         with db() as conn:
             conn.execute(
-                "UPDATE orders SET generation_status = 'completed' WHERE id = ?",
+                """
+                UPDATE orders
+                SET generation_status = 'completed'
+                WHERE id = ?
+                """,
                 (order_id,),
             )
 
-        # Keep generated files under the public Flask path.
-        download_url = f"/download/{order_id}"
         return page(
             "Дайын презентация",
             f"""
-            <h2>Презентация дайын! 🎉</h2>
-            <p><b>Тапсырыс:</b> #{order_id}</p>
-            <p><b>Тақырып:</b> {html.escape(order['topic'])}</p>
-            <div class="note">AI презентацияны автоматты түрде жасады.</div>
-            <a class="button" href="{download_url}">PPTX жүктеу 📥</a>
-            <br><a class="button secondary" href="/">Басты бет</a>
-            """,
+<h2>Презентация дайын! 🎉</h2>
+
+<p>
+<b>Тапсырыс:</b>
+#{order_id}
+</p>
+
+<p>
+<b>Тақырып:</b>
+{html.escape(order["topic"])}
+</p>
+
+<div class="note">
+PPTX жасалды.
+Суреттер Wikimedia Commons-тен
+автоматты түрде ізделді.
+</div>
+
+<a
+    class="button"
+    href="/download/{order_id}"
+>
+PPTX жүктеу 📥
+</a>
+
+<br>
+
+<a
+    class="button secondary"
+    href="/"
+>
+Басты бет
+</a>
+""",
         )
+
     except Exception as e:
         with db() as conn:
             conn.execute(
-                "UPDATE orders SET generation_status = 'unlocked' WHERE id = ?",
+                """
+                UPDATE orders
+                SET generation_status = 'unlocked'
+                WHERE id = ?
+                """,
                 (order_id,),
             )
+
         return page(
             "Генерация қатесі",
-            f"<h2>Презентация жасау кезінде қате ❌</h2><pre>{html.escape(str(e))}</pre>"
-            "<a class='button' href='/'>Басты бет</a>",
+            f"""
+<h2>Презентация жасау кезінде қате ❌</h2>
+
+<pre>{html.escape(str(e))}</pre>
+
+<a class="button" href="/">
+Басты бет
+</a>
+""",
             500,
         )
 
 
+# =========================
+# DOWNLOAD
+# =========================
 @app.route("/download/<int:order_id>")
 def download_presentation(order_id):
-    from flask import send_file
     customer_id = customer_id_from_request()
+
     with db() as conn:
         order = conn.execute(
-            "SELECT * FROM orders WHERE id = ? AND customer_id = ?",
-            (order_id, customer_id),
+            """
+            SELECT *
+            FROM orders
+            WHERE id = ?
+            AND customer_id = ?
+            """,
+            (
+                order_id,
+                customer_id,
+            ),
         ).fetchone()
-    path = Path("generated") / f"presentation_{order_id}.pptx"
-    if not order or order["service"] != "Презентация" or order["generation_status"] != "completed" or not path.exists():
-        return page("Файл жоқ", "<h2>Файл табылмады ❌</h2>", 404)
-    return send_file(path, as_attachment=True, download_name=f"Tapsyrys_presentation_{order_id}.pptx")
+
+    path = (
+        Path("generated")
+        / f"presentation_{order_id}.pptx"
+    )
+
+    if (
+        not order
+        or order["service"] != "Презентация"
+        or order["generation_status"] != "completed"
+        or not path.exists()
+    ):
+        return page(
+            "Файл жоқ",
+            "<h2>Файл табылмады ❌</h2>",
+            404,
+        )
+
+    return send_file(
+        path,
+        as_attachment=True,
+        download_name=(
+            f"Tapsyrys_presentation_{order_id}.pptx"
+        ),
+    )
 
 
-# ---------- Canva OAuth ----------
-
+# =========================
+# CANVA LOGIN
+# =========================
 @app.route("/canva/login")
 def canva_login():
     if not CLIENT_ID:
         return page(
             "Қате",
-            "<h2>Қате ❌</h2><p>CANVA_CLIENT_ID табылмады.</p>",
+            """
+<h2>Қате ❌</h2>
+<p>CANVA_CLIENT_ID табылмады.</p>
+""",
             500,
         )
 
     state = secrets.token_urlsafe(32)
+
     code_verifier, code_challenge = make_pkce()
-    save_state(state, code_verifier)
+
+    save_state(
+        state,
+        code_verifier,
+    )
 
     params = {
         "client_id": CLIENT_ID,
@@ -615,24 +1698,43 @@ def canva_login():
     }
 
     return redirect(
-        CANVA_AUTHORIZE_URL + "?" + urllib.parse.urlencode(params)
+        CANVA_AUTHORIZE_URL
+        + "?"
+        + urllib.parse.urlencode(params)
     )
 
 
+# =========================
+# CANVA CALLBACK
+# =========================
 @app.route("/canva/callback")
 def canva_callback():
     error = request.args.get("error")
+
     if error:
         description = request.args.get(
-            "error_description", "Canva OAuth қатесі"
+            "error_description",
+            "Canva OAuth қатесі",
         )
+
         return page(
             "OAuth қатесі",
             f"""
 <h2>Canva OAuth қатесі ❌</h2>
-<p><b>Error:</b> {html.escape(error)}</p>
-<p><b>Description:</b> {html.escape(description)}</p>
-<a href="/">Басты бетке қайту</a>
+
+<p>
+<b>Error:</b>
+{html.escape(error)}
+</p>
+
+<p>
+<b>Description:</b>
+{html.escape(description)}
+</p>
+
+<a href="/">
+Басты бетке қайту
+</a>
 """,
             400,
         )
@@ -643,61 +1745,124 @@ def canva_callback():
     if not code:
         return page(
             "Код жоқ",
-            "<h2>Authorization code жоқ ❌</h2><a href='/'>Басты бетке қайту</a>",
+            """
+<h2>Authorization code жоқ ❌</h2>
+<a href="/">Басты бетке қайту</a>
+""",
             400,
         )
 
-    code_verifier = pop_state(state) if state else None
+    code_verifier = (
+        pop_state(state)
+        if state
+        else None
+    )
+
     if not code_verifier:
         return page(
             "State қатесі",
-            "<h2>OAuth State қатесі ❌</h2><a href='/'>Басты бетке қайту</a>",
+            """
+<h2>OAuth State қатесі ❌</h2>
+<a href="/">Басты бетке қайту</a>
+""",
             400,
         )
 
     if not CLIENT_ID or not CLIENT_SECRET:
         return page(
             "Қате",
-            "<h2>CANVA_CLIENT_ID немесе CANVA_CLIENT_SECRET жоқ ❌</h2>",
+            """
+<h2>
+CANVA_CLIENT_ID немесе
+CANVA_CLIENT_SECRET жоқ ❌
+</h2>
+""",
             500,
         )
 
     try:
-        credentials = f"{CLIENT_ID}:{CLIENT_SECRET}"
-        encoded_credentials = base64.b64encode(
-            credentials.encode("utf-8")
-        ).decode("utf-8")
+        credentials = (
+            f"{CLIENT_ID}:{CLIENT_SECRET}"
+        )
+
+        encoded_credentials = (
+            base64.b64encode(
+                credentials.encode("utf-8")
+            ).decode("utf-8")
+        )
 
         data = urllib.parse.urlencode(
             {
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": REDIRECT_URI,
-                "code_verifier": code_verifier,
+                "grant_type":
+                    "authorization_code",
+                "code":
+                    code,
+                "redirect_uri":
+                    REDIRECT_URI,
+                "code_verifier":
+                    code_verifier,
             }
         ).encode("utf-8")
 
         req = urllib.request.Request(
-            CANVA_TOKEN_URL, data=data, method="POST"
+            CANVA_TOKEN_URL,
+            data=data,
+            method="POST",
         )
-        req.add_header("Authorization", "Basic " + encoded_credentials)
-        req.add_header("Content-Type", "application/x-www-form-urlencoded")
-        req.add_header("Accept", "application/json")
 
-        with urllib.request.urlopen(req, timeout=30) as response:
-            result = response.read().decode("utf-8")
+        req.add_header(
+            "Authorization",
+            "Basic "
+            + encoded_credentials,
+        )
+
+        req.add_header(
+            "Content-Type",
+            "application/x-www-form-urlencoded",
+        )
+
+        req.add_header(
+            "Accept",
+            "application/json",
+        )
+
+        with urllib.request.urlopen(
+            req,
+            timeout=30,
+        ) as response:
+            result = (
+                response
+                .read()
+                .decode("utf-8")
+            )
 
         token_data = json.loads(result)
 
-        if not token_data.get("access_token"):
+        if not token_data.get(
+            "access_token"
+        ):
             safe = {
                 k: v
                 for k, v in token_data.items()
-                if k in ("error", "error_description")
+                if k in (
+                    "error",
+                    "error_description",
+                )
             }
+
             return page(
                 "Токен алынбады",
-                f"<pre>{html.escape(json.dumps(safe, indent=2, ensure_ascii=False))}</pre>",
+                f"""
+<pre>
+{html.escape(
+    json.dumps(
+        safe,
+        indent=2,
+        ensure_ascii=False
+    )
+)}
+</pre>
+""",
                 400,
             )
 
@@ -707,20 +1872,39 @@ def canva_callback():
             "Canva Connected",
             """
 <h1>Canva сәтті қосылды! ✅</h1>
-<p>Canva аккаунты Tapsyrys AI жүйесіне қосылды.</p>
-<a class="button" href="/">Басты бетке қайту</a>
+
+<p>
+Canva аккаунты Tapsyrys AI жүйесіне қосылды.
+</p>
+
+<a class="button" href="/">
+Басты бетке қайту
+</a>
 """,
         )
 
     except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8", errors="ignore")
+        error_body = e.read().decode(
+            "utf-8",
+            errors="ignore",
+        )
+
         return page(
             "Token қатесі",
             f"""
 <h2>Canva Token қатесі ❌</h2>
-<p>HTTP: {e.code}</p>
-<pre>{html.escape(error_body)}</pre>
-<a href="/">Басты бетке қайту</a>
+
+<p>
+HTTP: {e.code}
+</p>
+
+<pre>
+{html.escape(error_body)}
+</pre>
+
+<a href="/">
+Басты бетке қайту
+</a>
 """,
             400,
         )
@@ -728,23 +1912,64 @@ def canva_callback():
     except Exception as e:
         return page(
             "Сервер қатесі",
-            f"<h2>Сервер қатесі ❌</h2><pre>{html.escape(str(e))}</pre>",
+            f"""
+<h2>Сервер қатесі ❌</h2>
+
+<pre>
+{html.escape(str(e))}
+</pre>
+""",
             500,
         )
 
 
+# =========================
+# HEALTH
+# =========================
 @app.route("/health")
 def health():
-    return {"status": "ok", "service": "Tapsyrys AI"}
+    return {
+        "status": "ok",
+        "service": "Tapsyrys AI",
+        "images": "Wikimedia Commons",
+        "openai": False,
+    }
 
 
+# =========================
+# PKCE
+# =========================
 def make_pkce():
     code_verifier = secrets.token_urlsafe(64)
-    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
-    code_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-    return code_verifier, code_challenge
+
+    digest = hashlib.sha256(
+        code_verifier.encode("ascii")
+    ).digest()
+
+    code_challenge = (
+        base64.urlsafe_b64encode(digest)
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+
+    return (
+        code_verifier,
+        code_challenge,
+    )
 
 
+# =========================
+# START
+# =========================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    port = int(
+        os.environ.get(
+            "PORT",
+            10000,
+        )
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+    )
